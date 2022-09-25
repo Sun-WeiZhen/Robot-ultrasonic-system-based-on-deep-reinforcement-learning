@@ -1,0 +1,891 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Aug 29 12:09:08 2022
+
+@author: wz Sun
+@email weizhen_sun01@163.com
+"""
+
+# 导入需要的库
+import os
+import sys
+from pathlib import Path
+import cv2
+import torch.backends.cudnn as cudnn
+import PySimpleGUI as sg  #pip install pysimplegui
+from skimage import io
+import matplotlib.pyplot as plt
+from itertools import count
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg,NavigationToolbar2Tk
+import tkinter as Tk
+from matplotlib.backends.backend_tkagg import  FigureCanvasAgg
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
+
+import gym
+import math
+import random
+import numpy as np
+from collections import namedtuple, deque
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision.transforms as T
+from torchvision.transforms import InterpolationMode
+import pandas as pd
+
+
+#到输入yolo5相关数据--------------------------
+font = cv2.FONT_HERSHEY_SIMPLEX
+# 初始化目录
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]  # 定义YOLOv5的根目录
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # 将YOLOv5的根目录添加到环境变量中（程序结束后删除）
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+from models.common import DetectMultiBackend
+from utils.datasets import IMG_FORMATS, VID_FORMATS, LoadImages, LoadStreams
+from utils.general import (LOGGER, check_file, check_img_size, check_imshow, check_requirements, colorstr,
+                           increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xyxy2xywh)
+from utils.plots import Annotator, colors, save_one_box
+from utils.torch_utils import select_device, time_sync
+# 导入letterbox
+from utils.augmentations import Albumentations, augment_hsv, copy_paste, letterbox, mixup, random_perspective
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")#
+print(torch.cuda.is_available())
+weights = ROOT / 'best.pt'  # 权重文件地址   .pt文件
+source = ROOT / 'data/images'  # 测试数据文件(图片或视频)的保存路径
+data = ROOT / 'data/QiGuan.yaml'  # 标签文件地址   .yaml文件
+
+imgsz = (640, 640)  # 输入图片的大小 默认640(pixels)
+conf_thres = 0.25  # object置信度阈值 默认0.25  用在nms中
+iou_thres = 0.45  # 做nms的iou阈值 默认0.45   用在nms中
+max_det = 1000  # 每张图片最多的目标数量  用在nms中
+#device = 'cpu'  # 设置代码执行的设备 cuda device, i.e. 0 or 0,1,2,3 or cpu
+classes = None  # 在nms中是否是只保留某些特定的类 默认是None 就是所有类只要满足条件都可以保留 --class 0, or --class 0 2 3
+agnostic_nms = False  # 进行nms是否也除去不同类别之间的框 默认False
+augment = False  # 预测是否也要采用数据增强 TTA 默认False
+visualize = False  # 特征图可视化 默认FALSE
+half = False  # 是否使用半精度 Float16 推理 可以缩短推理时间 但是默认是False
+dnn = False  # 使用OpenCV DNN进行ONNX推理
+
+# 载入模型
+model_yolo = DetectMultiBackend(weights, device=device, dnn=dnn, data=data)
+stride, names, pt, jit, onnx, engine = model_yolo.stride, model_yolo.names, model_yolo.pt, model_yolo.jit, model_yolo.onnx, model_yolo.engine
+imgsz = check_img_size(imgsz, s=stride)  # 检查图片尺寸
+# Half
+# 使用半精度 Float16 推理
+half &= (pt or jit or onnx or engine) and device.type != 'cpu'  # FP16 supported on limited backends with CUDA
+if pt or jit:
+    model_yolo.model.half() if half else model_yolo.model.float()
+#-----------------------------------------------------------------------------
+
+
+
+global action_list
+global imgfile_list
+global transition_path
+global action_path
+global image_list
+global action
+global reawrd
+global reward_time
+global m_reward
+
+
+#下载环境模型
+im3d = io.imread('D:\\3DUSRebuild\\MyYOLO5\\yolov5\\data\\ThreeModelUS\\US_model.tif')#读取三维模型
+#state = im3d[trans_x,trans_y,rotate_xy,fram_US,:,:,:]
+#创建一个Transition容器，具名元组。下面还需要对这个具名元组进行实例化。
+Transition = namedtuple('Transition',('state', 'action', 'next_state', 'reward'))
+class ReplayMemory(object):
+
+    def __init__(self, capacity):
+        self.memory = deque([], maxlen=capacity)#创建一个replay buffer 双向队列,先进显出
+
+    def push(self, *args):
+        self.memory.append(Transition(*args))#将每个Transition添加到replay buffer
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)#在replay buffer中随机采样
+
+    def __len__(self):
+        return len(self.memory)#判断replay buffer中Transition的数量
+######################################################################
+# DQN algorithm
+
+class DownSample(nn.Module):
+
+    def __init__(self, in_channel, out_channel, stride):
+        super(DownSample, self).__init__()
+        self.down = nn.Sequential(
+            nn.Conv2d(in_channel, out_channel, kernel_size=1, stride=stride, padding=0, bias=False),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        out = self.down(x)
+        return out
+
+class DQN(nn.Module):
+    def __init__(self, classes_num):                                # ResNet50仅传一个分类数目，将涉及的所有数据写死，具体数据可以参考下面的图片
+        super(DQN, self).__init__()
+        # 在进入layer1234之间先进行预处理，主要是一次卷积一次池化，从[batch, 3, 224, 224] => [batch, 64, 56, 56]
+        self.pre = nn.Sequential(
+            # 卷积channel从原始数据的3通道，采用64个卷积核，升到64个channel，卷积核大小、步长、padding均固定
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),                                     # 卷积后紧接一次BatchNormalization
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)        # 预处理最后的一次最大池化操作，数据固定
+        )
+        """
+        每一个layer的操作分为使用一次的first，和使用多次的next组成，first负责每个layer的第一个单元（有虚线）的三次卷积，next负责剩下单元（直连）的三次卷积
+        """
+        # --------------------------------------------------------------
+        self.layer1_first = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False),      # layer1_first第一次卷积保持channel不变，和其他layer的first区别
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),      # layer1_first第二次卷积stride和其他layer_first的stride不同
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 256, kernel_size=1, stride=1, padding=0, bias=False),     # layer1_first第三次卷积和其他layer一样，channel升4倍
+            nn.BatchNorm2d(256)                                         # 注意最后一次卷积结束不加ReLU激活函数
+        )
+        self.layer1_next = nn.Sequential(
+            nn.Conv2d(256, 64, kernel_size=1, stride=1, padding=0, bias=False),     # layer1_next的第一次卷积负责将channel减少，减少训练参数量
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 256, kernel_size=1, stride=1, padding=0, bias=False),     # layer1_next的最后一次卷积负责将channel增加至可以与shortcut相加
+            nn.BatchNorm2d(256)
+        )
+        # --------------------------------------------------------------    # layer234操作基本相同，这里仅介绍layer2
+        self.layer2_first = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=1, stride=1, padding=0, bias=False),    # 与layer1_first第一次卷积不同，需要降channel至1/2
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=False),    # 注意这里的stride=2与layer34相同，与layer1区别
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 512, kernel_size=1, stride=1, padding=0, bias=False),    # 再次升channel
+            nn.BatchNorm2d(512)
+        )
+        self.layer2_next = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=1, stride=1, padding=0, bias=False),    # 负责循环普通的操作
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 512, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512)
+        )
+        # --------------------------------------------------------------
+        self.layer3_first = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1024, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(1024)
+        )
+        self.layer3_next = nn.Sequential(
+            nn.Conv2d(1024, 256, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1024, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(1024)
+        )
+        # --------------------------------------------------------------
+        self.layer4_first = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 2048, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(2048)
+        )
+        self.layer4_next = nn.Sequential(
+            nn.Conv2d(2048, 512, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 2048, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(2048)
+        )
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))     # 经过最后的自适应均值池化为[batch, 2048, 1, 1]
+        # 定义最后的全连接层
+        self.fc = nn.Sequential(
+            nn.Dropout(p=0.5),                  # 以0.5的概率失活神经元
+            nn.Linear(2048 * 1 * 1, 1024),      # 第一个全连接层
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(1024, classes_num)        # 第二个全连接层，输出类结果
+        )
+
+    def forward(self, x):
+        x = x.to(device)
+        out = self.pre(x)  # 对输入预处理，输出out = [batch, 64, 56, 56]
+        """
+        每一层layer操作由两个部分组成，第一个是带有虚线的卷积单元，其他的是循环完成普通的shortcut为直连的卷积单元
+        """
+        layer1_shortcut1 = DownSample(64, 256, 1)  # 使用DownSample实例化一个网络模型layer1_shortcut1，参数即是虚线处升channel数据，注意stride=1
+        layer1_shortcut1.to('cuda:0')
+        layer1_identity1 = layer1_shortcut1(out)  # 调用layer1_shortcut1对卷积单元输入out计算虚线处的identity，用于后面与卷积单元输出相加
+        out = self.layer1_first(out)  # 调用layer1_first完成layer1的第一个特殊的卷积单元
+        out = F.relu(out + layer1_identity1, inplace=True)  # 将identity与卷积单元输出相加，经过relu激活函数
+
+        for i in range(2):  # 使用循环完成后面几个相同输入输出相同操作的卷积单元
+            layer_identity = out  # 直接直连identity等于输入
+            out = self.layer1_next(out)  # 输入经过普通卷积单元
+            out = F.relu(out + layer_identity, inplace=True)  # 两路结果相加，再经过激活函数
+        # --------------------------------------------------------------后面layer234都是类似的，这里仅介绍layer2
+
+        layer2_shortcut1 = DownSample(256, 512, 2)  # 注意后面layer234输入输出channel不同，stride=2都是如此
+        layer2_shortcut1.to('cuda:0')
+        layer2_identity1 = layer2_shortcut1(out)
+        out = self.layer2_first(out)
+        out = F.relu(out + layer2_identity1, inplace=True)  # 完成layer2的第一个卷积单元
+
+        for i in range(3):  # 循环执行layer2剩下的其他卷积单元
+            layer_identity = out
+            out = self.layer2_next(out)
+            out = F.relu(out + layer_identity, inplace=True)
+        # --------------------------------------------------------------
+
+        layer3_shortcut1 = DownSample(512, 1024, 2)
+        layer3_shortcut1.to('cuda:0')
+        layer3_identity1 = layer3_shortcut1(out)
+        out = self.layer3_first(out)
+        out = F.relu(out + layer3_identity1, inplace=True)
+
+        for i in range(5):
+            layer_identity = out
+            out = self.layer3_next(out)
+            out = F.relu(out + layer_identity, inplace=True)
+        # --------------------------------------------------------------
+
+        layer4_shortcut1 = DownSample(1024, 2048, 2)
+        layer4_shortcut1.to('cuda:0')
+        layer4_identity1 = layer4_shortcut1(out)
+        out = self.layer4_first(out)
+        out = F.relu(out + layer4_identity1, inplace=True)
+
+        for i in range(2):
+            layer_identity = out
+            out = self.layer4_next(out)
+            out = F.relu(out + layer_identity, inplace=True)
+        # 最后一个全连接层
+        out = self.avg_pool(out)  # 经过最后的自适应均值池化为[batch, 2048, 1, 1]
+        out = out.reshape(out.size(0), -1)  # 将卷积输入[batch, 2048, 1, 1]展平为[batch, 2048*1*1]
+        out = self.fc(out)  # 经过最后一个全连接单元，输出分类out
+
+        return out
+
+#搭建DQN的主体网络结构，这边没什么可说的，按照自己的需求搭建网络，也可以用3D网络
+class DQN1(nn.Module):
+    #在DQN游戏中，输入图像的尺寸只有84*84，所以不需要太大的
+    def __init__(self, h, w, outputs):
+        super(DQN1, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.bn3 = nn.BatchNorm2d(64)
+
+        def conv2d_size_out(size, kernel_size, stride):
+            return (size - (kernel_size - 1) - 1) // stride  + 1
+        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, 8, 4), 4, 2), 3, 1)
+        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
+        linear_input_size = convw * convh * 64
+        self.l1 = nn.Linear(linear_input_size, 512)
+        self.l2 = nn.Linear(512, outputs)
+
+    def forward(self, x):
+        x = x.to(device)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.l1(x.view(x.size(0), -1)))
+        return self.l2(x.view(-1, 512))
+
+
+######################################################################
+# Input extraction
+#T.Grayscale，图像灰度化
+#T.Resize，控制图像尺寸
+#T.ToTensor，转换成张量
+#更换不同网络模型时，需要修改图像的输入尺寸。原始模型输入尺寸为84*84.ResNet的尺寸为224*224
+resize = T.Compose([T.ToPILImage(),
+                    T.Grayscale(num_output_channels=3),
+                    T.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+                    T.ToTensor()])
+
+######################################################################
+
+
+# Training
+
+# 参数和网络初始化
+BATCH_SIZE = 32
+GAMMA = 0.92
+EPS_START = 1.0
+EPS_END = 0.1
+EPS_DECAY = 10000
+TARGET_UPDATE = 200
+
+
+#init_screen = get_screen()#截取游戏屏幕，这个换成需要加载的图像
+#在USprobe guide中可以直接从tif和replay buffer中获取图像
+#_, _, screen_height, screen_width = init_screen.shape#获取游戏画面的尺寸
+
+#这边需要根据实际情况修改
+screen_height = 664
+screen_width = 549
+# 获得算法的动作空间
+n_actions = 8
+
+
+#----使用原始模型------------
+policy_net = DQN(n_actions).to(device)
+target_net = DQN(n_actions).to(device)
+target_net.load_state_dict(policy_net.state_dict())
+target_net.eval()
+
+#设置优化器
+#optimizer = optim.SGD(policy_net.parameters(), lr=0.1, momentum=0.9)
+optimizer = optim.RMSprop(policy_net.parameters(), lr=0.1, alpha=0.9,eps=1e-08)#设置优化器
+#optimizer = optim.Adam(policy_net.parameters(), lr=0.1, betas=(0.9, 0.999),eps=1e-08)#设置优化器
+StepLR = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.4)
+memory = ReplayMemory(50000)#设置replay buffer的容量
+
+
+#选择动作
+#这个函数是与实际环境交互时会用到的动作选择函数
+#当在我们的视频数据集中训练时，则不需要这个函数
+
+#action_space = ['x','-x','wx','-wx','y','-y','wy','-wy']#
+action_space = [0,1,2,3,4,5,6,7]#
+# #读取三维模型模型空间（10，8，2，12，468，618）
+
+
+episode_durations = []#训练数据的历史过程
+
+#把智能体每日一次的步数画出来
+def plot_durations():
+    plt.figure(1)
+    plt.clf()
+    durations_t = torch.tensor(episode_durations, dtype=torch.float)
+    plt.title('Training...')
+    plt.xlabel('Episode')
+    plt.ylabel('Duration')
+    plt.plot(durations_t.numpy())
+    arr1 = durations_t.numpy()
+    data1 = pd.DataFrame(arr1)
+    data1.to_csv('data1.csv')#存储到csv文件
+    # Take 100 episode averages and plot them too
+    if len(durations_t) >= 10:
+        means = durations_t.unfold(0, 10, 1).mean(1).view(-1)
+        means = torch.cat((torch.zeros(9), means))
+        data2 = pd.DataFrame(means)
+        data2.to_csv('data2.csv')#存储到csv文件
+        plt.plot(means.numpy())
+    plt.pause(0.001)  # pause a bit so that plots are updated
+
+reward_durations = []
+
+#把智能体每日一次的奖励画出来
+def plot_reward():
+    plt.figure(2)
+    plt.clf()
+    reward_t = torch.tensor(reward_durations, dtype=torch.float)
+    plt.title('Training...')
+    plt.xlabel('Episode')
+    plt.ylabel('average reward')
+    plt.plot(reward_t.numpy())
+    arr1 = reward_t.numpy()
+    data1 = pd.DataFrame(arr1)
+    data1.to_csv('r_data1.csv')#存储到csv文件
+    # Take 100 episode averages and plot them too
+    if len(reward_t) >= 10:
+        means = reward_t.unfold(0, 10, 1).mean(1).view(-1)
+        means = torch.cat((torch.zeros(9), means))
+        data2 = pd.DataFrame(means)
+        data2.to_csv('r_data2.csv')#存储到csv文件
+        plt.plot(means.numpy())
+
+    plt.pause(0.001)  # pause a bit so that plots are updated
+#开始优化网络结构
+def optimize_model():
+    if len(memory) < BATCH_SIZE:
+        return print('transiton个数没达到指定数量....')
+    transitions = memory.sample(BATCH_SIZE)#从replay buffer中选择transitions
+    #转置batch（有关详细说明，请参阅https://stackoverflow.com/a/19343/3343043）
+    #这会将transitions的batch数组转换为batch数组的过渡。
+    batch = Transition(*zip(*transitions))#这边其实是实例化这个具名元组，首先我们从memory按批次（129）采集一定量的transitions
+    #然后，使用*解压这个批次的transitions，将四个元素集中到同一个元组中。然后，再用zip压缩成128维的4*1元组。
+    #然后再解压出来就完成实例化Transition的任务了，这个时候的transition中有
+    
+    # 计算非最终状态的掩码并连接batch元素（最终状态将是模拟结束后的状态）
+    #这个tuple(map(lambda s...）函数的作用是判断状态s是否是最终状态，如果不是最终状态就把batch.next_state赋值给s
+    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)),device=device, dtype=torch.bool)
+    non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
+    state_batch = torch.cat(batch.state)  #将状态连接到一起，按列组合
+    action_batch = torch.cat(batch.action)#将动作连接到一起，按列组合
+    reward_batch = torch.cat(batch.reward)#将奖励连接到一起，按列组合
+    state_batch.to('cuda:0')  # =======================
+    action_batch.to('cuda:0')  # =======================
+    #d1 = torch.LongTensor(batch.done).to(device)
+
+    state_action_values = policy_net(state_batch).gather(1, action_batch)#根据动作值选择相应的状态
+    next_state_values = torch.zeros(BATCH_SIZE, device=device)#生成一个尺寸为BATCH_SIZE的张量
+    next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
+    expected_state_action_values = (next_state_values * GAMMA) + reward_batch#计算期望的状态动作值
+    # 设置我们的损失函数
+    criterion = nn.MSELoss()#
+    #损失函数的输入是状态值和期望的状态值
+    loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+
+    # Optimize the model
+    optimizer.zero_grad()
+    loss.backward()#损失函数反向传播
+    for param in policy_net.parameters():
+        param.grad.data.clamp_(-1, 1)#梯度裁剪
+    optimizer.step()
+
+def detect_orgen(img):
+    # Dataloader
+    # 载入数据
+    #dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
+    # Run inference
+    # 开始预测
+    model_yolo.warmup(imgsz=(1, 3, *imgsz), half=half)  # warmup
+    dt, seen = [0.0, 0.0, 0.0], 0
+    img2 = img
+    # 对图片进行处理,转三通道
+    #im0 = img
+    #img2 = np.zeros_like(im0)
+    #img2[:, :, 0] = im0
+    #img2[:, :, 1] = im0
+    #img2[:, :, 2] = im0
+    # Padded resize
+    im = letterbox(img2, imgsz, stride, auto=pt)[0]
+    # Convert
+    #print('图像尺寸', im.shape)
+    im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+    im = np.ascontiguousarray(im)
+    t1 = time_sync()
+    im = torch.from_numpy(im).to(device)
+    im = im.half() if half else im.float()  # uint8 to fp16/32
+    im /= 255  # 0 - 255 to 0.0 - 1.0
+    if len(im.shape) == 3:
+        im = im[None]  # expand for batch dim
+    t2 = time_sync()
+    dt[0] += t2 - t1
+    # Inference
+    # 预测
+    pred = model_yolo(im, augment=augment, visualize=visualize)
+    t3 = time_sync()
+    dt[1] += t3 - t2
+    # NMS
+    pred1 = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+    dt[2] += time_sync() - t3
+    # 用于存放结果
+    detections = []
+    # Process pr-edictions
+    for i, det in enumerate(pred1):  # per image 每张图片
+        seen += 1
+        # im0 = im0s.copy()
+        if len(det):
+            # Rescale boxes from img_size to im0 size
+            det[:, :4] = scale_coords(im.shape[2:], det[:, :4], img2.shape).round()
+            # Write results
+            # 写入结果
+            for *xyxy, conf, cls in reversed(det):
+                xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4))).view(-1).tolist()
+                xywh = [round(x) for x in xywh]
+                xywh = [xywh[0] - xywh[2] // 2, xywh[1] - xywh[3] // 2, xywh[2],
+                        xywh[3]]  # 检测到目标位置，格式：（left，top，w，h）
+                cls = names[int(cls)]
+                conf = float(conf)
+                detections.append({'class': cls, 'conf': conf, 'position': xywh})
+    # 推测的时间
+    #LOGGER.info(f'({t3 - t2:.3f}s)')
+    if len(detections) == 1:
+        posi = xywh  # 提取目标位置信息
+        mx = int(posi[0] + posi[2] * 0.5)
+        my = int(posi[1] + posi[3] * 0.5)
+        # pre = (mx,my)#目标器官的中心坐标
+        orgen_area = posi[2] * posi[3]
+        xyimg = im.shape
+        dist2center = abs(xyimg[2] * 0.5 - mx)
+        DK = True
+        return orgen_area, dist2center,DK
+    else:
+        orgen_area = 0
+        dist2center = 0
+        DK = False
+        return orgen_area, dist2center, DK
+
+def Sample_img(img_coordinate):
+    #根据变换后的图像标签采集图像
+    trans_x = img_coordinate[0]
+    trans_y = img_coordinate[1]
+    rotate_xy = img_coordinate[2]
+    fram_US = img_coordinate[3]
+    US_img = im3d[trans_x,trans_y,rotate_xy,fram_US,:,:,:]
+    screen = US_img.transpose((2, 0, 1))#修改图像通道位置
+    #screen = np.ascontiguousarray(screen, dtype=np.float32) / 255#返回一个连续的array，其内存是连续的，运行会更快
+    screen = np.ascontiguousarray(screen, dtype=np.float32) / 255  # 返回一个连续的array，其内存是连续的，运行会更快
+    screen = torch.from_numpy(screen)#torch.from_numpy()用来将数组array转换为张量Tensor
+    screen.to('cuda:0')#=======================
+    # Resize, and add a batch dimension (BCHW)
+    screen = resize(screen).unsqueeze(0)
+    return screen,US_img
+
+def change_imgcoord(img_coordinate,action_tmp):
+    #这个函数返回的是执行一个动作之后需要采集图像的位置
+    #action_space = ['x','-x','wx','-wx','y','-y','wy','-wy']
+    trans_x = img_coordinate[0]
+    trans_y = img_coordinate[1]
+    rotate_xy  = img_coordinate[2]#这个其实用不到，应为关于旋转的坐标只有0，1两个，我们直接在变换阶段修改
+    fram_US = img_coordinate[3]
+    # Transpose it into torch order (CHW).
+    probe_a = action_tmp#
+    #[10,8,2,16,640,640,3]
+    if probe_a == 0:
+        if trans_x <9:
+            img_coordinate[0] = trans_x + 1
+        else:
+            pass
+    elif probe_a == 1:
+        if trans_x >0:
+            img_coordinate[0] = trans_x - 1
+        else:
+            pass
+    elif probe_a == 2:
+        if fram_US<14:
+            img_coordinate[3] = fram_US+1
+            img_coordinate[2] = 0#由于在检索时，旋转坐标是共用的，因此我们需要实时切换0，1
+        else:
+            pass
+    elif probe_a == 3:
+        if fram_US>0:
+            img_coordinate[3] = fram_US-1
+            img_coordinate[2] = 0#切换旋转数据集
+        else:
+            pass
+    elif probe_a == 4:
+        if trans_y <7:
+            img_coordinate[1] = trans_y + 1
+        else:
+            pass
+    elif probe_a == 5:
+        if trans_y >0:
+            img_coordinate[1] = trans_y - 1
+        else:
+            pass
+    elif probe_a == 6:
+        if fram_US < 14:
+            img_coordinate[3] = fram_US+1
+            img_coordinate[2] = 1#切换旋转数据集
+        else:
+            pass
+    elif probe_a == 7:
+        if fram_US > 0:
+            img_coordinate[3] = fram_US-1
+            img_coordinate[2] = 1#切换旋转数据集
+        else:
+            pass
+
+    return img_coordinate
+
+def select_action(state):
+    global steps_done
+    global trans_x
+    global trans_y
+    global rotate_xy
+    global fram_US
+    state.to('cuda:0')  # =======================
+    sample = random.random()#生成随机数
+    #这个是一个曲线，就是随机选择动作的概率，随机选择动作表示探索
+    eps_threshold = EPS_END + (EPS_START - EPS_END) * \
+        math.exp(-1. * steps_done / EPS_DECAY)
+    steps_done += 1#每选择一个动作，step+1
+    #下面是一个if条件句，用于判断是随机选择动作，还是使用模型的动作
+    if sample > eps_threshold:
+        with torch.no_grad():
+            #当sample大于eps_threshold时，用策略模型选择动作
+            action_tensor = policy_net(state).max(1)[1].view(1, 1)
+            return action_tensor
+    else:
+        #否则就随机选择一个动作，就连动作也得装换成一个张量
+        #随机选择动作需要重新设计
+        rand_sa = random.randint(0,7)#生成一个随机数，用于选择动作
+        action_tensor = torch.tensor([[rand_sa]], device=device, dtype=torch.long)
+        action_tensor.to('cuda:0')#=======================
+
+        return action_tensor
+
+def probe_step(img_coordinate,twoimdquen):
+    done = False
+    trans_x = img_coordinate[0]
+    trans_y = img_coordinate[1]
+    rotate_xy  = img_coordinate[2]
+    fram_US = img_coordinate[3]
+    screen,imgt = Sample_img(img_coordinate)
+    imgt_1 = twoimdquen[0]#
+    next_state = screen
+    next_state.to('cuda:0')  # =======================
+    orgen_S1, disten2C1, DK1 = detect_orgen(imgt)#DK是判断算法是否检测到器官，当检测到器官时，DK=True，否则DK=false
+    orgen_S2, disten2C2, DK2 = detect_orgen(imgt_1)#前一时刻的图像
+    err_D = disten2C1-disten2C2 #err_D大于零说明远离最优位置，惩罚
+    err_S = orgen_S1-orgen_S2 #err_S大于零说明面积在减小，惩罚
+    # or DK1==False
+    if err_D < 0 or err_S > 0:
+        reward = 0.4#正确的动作给较少的奖励，防止agent刷分
+    else:
+        reward = -0.4#错误的动作给更多的惩罚
+    if trans_x < 1 or trans_x > 9 or trans_y < 1 or trans_y > 7 or fram_US < 1 or fram_US > 14 or DK1 == False:
+        reward = -20
+        done = True
+    if orgen_S1 > 8000 and disten2C1 < 20:
+        reward = 20
+        done = True
+    return next_state, reward, done
+
+
+
+#next_state, reward, done = self.env.step(action)
+
+def random_start(img_coordinate,rand_action):
+    #随机初始化是为了采集图像
+    global state_queue#生成一个双端序列用于存储状态
+    global next_state_queue#生成一个双端序列用于存储下一个状态
+    global twoimg_queue #生成一个双端序列,只存储两个图像，用于存储前后两帧的图像
+    done = False #初始阶段默认false
+    action = rand_action
+    for i in range(4):
+        #随机初始化，只初始化5步
+        USimagecoord = change_imgcoord(img_coordinate, action)#根据动作修改提取图像的标签
+        imgtensor, imgarr = Sample_img(USimagecoord)#根据标签提取图像
+        twoimg_queue.append(imgarr)#每动作一次把当前图像存储进去。双端序列，t-1时刻的图像会自动被删除
+        if (i+1) <= 1:
+            #当i+1小于等于1时，把图像存放到state_queue
+            state_queue.append(imgtensor)
+        elif 1 < (i + 1) <= 2:
+            #进入下一个m，当这个m大于1小于2时，把图像存储到next_state_queue
+            next_state_queue.append(imgtensor)
+        else:
+            #否则的话，就把next_state_queue的图像存入到下一个循环的state_queue
+            state_queue.append(next_state_queue[0])
+            #然后把接下来的图像存储到next_state_queue
+            next_state_queue.append(imgtensor)
+        if i >2:
+            next_state, reward, done = probe_step(img_coordinate,twoimg_queue)
+        else:
+            pass
+        action = random.randint(0, 7)  #
+        if done:
+            break
+    return done, state_queue, next_state_queue,twoimg_queue
+
+######################################################################
+#创建从video生成transitions并填充到replay memory中的函数
+#Create a function that generates transitions from video and fills them into replay memory
+#用到这个函数，一个是提供状态和下一个状态，另一个是根据状态选择动作
+steps_done = 0#设置步数
+state_queue = deque([], maxlen=1)#生成一个双端序列用于存储状态
+next_state_queue = deque([], maxlen=1)#生成一个双端序列用于存储下一个状态
+twoimg_queue = deque([], maxlen=2)#生成一个双端序列,只存储两个图像，用于存储前后两帧的图像
+
+#avg_reward = []
+total_reward = 0
+total_rewardall = []
+#训练开始首先生成新的replay memory
+
+
+rootpath = 'C:\\Users\\DELL\\Desktop\\TDQN_PYTORCH\\DRL_vedio_data'  # 总的文件路径,这个文件下所有动作
+#文件名称：dannd_pwx_a_r1
+print('------------开始填充replay memory-------------------')
+for root, dirs, files in os.walk(rootpath):
+    action_list = dirs  # 总文件下动作文件名的列表:xt1r1 xt22r2等文件，该文件包含
+#应该从下面这个大循环开始一个一个文件的处理
+for j in range(len(action_list)):
+    #reward = None
+    #action = None
+    # 每个动作文件名中包含了执行该动作或获取的奖励和执行该动作完毕后获取的最终奖励
+    #通过该循环一个一个处理xt1r1等文件下的图像
+    #首先需要根据文件名提取该文件所包含数据的动作和奖励
+    actionk = action_list[j]  # 获取当前动作
+    action_str = actionk[0:3]  # 获取动作名 xt1 yt1 xw1 yw1为正方向，xt2 yt2 xw2 yw2为负方向
+    reward_time = actionk[3:5]  # 获取实时奖励r1为正，r2为负
+
+    if action_str == 'xt1':
+        action = 0
+    elif action_str == 'xt2':
+        action = 1
+    elif action_str == 'yt1':
+        action = 2
+    elif action_str == 'yt2':
+        action = 3
+    elif action_str == 'xw1':
+        action = 4
+    elif action_str == 'xw2':
+        action = 5
+    elif action_str == 'yw1':
+        action = 6
+    elif action_str == 'yw2':
+        action = 7
+
+    if reward_time == 'r1':
+        reward = 0.4
+    else:
+        reward = -0.4
+
+    #将action和reward转为张量
+    action = torch.tensor([[action]], device=device, dtype=torch.long)
+    reward = torch.tensor([[reward]], device=device, dtype=torch.long)
+    action_path = os.path.join(rootpath, action_list[j])  # C:\Users\DELL\Desktop\TDQN_PYTORCH\DRL_vedio_data\xt1r1文件下有轨迹包文件，从这些文件中读取轨迹并保存到transition中，组合路径，图像文件的路径
+    # action_space = ['x', '-x', 'wx', '-wx', 'y', '-y', 'wy', '-wy']
+    for root, dirs, files in os.walk(action_path):
+        action_list = dirs  # 读取轨迹文件列表 d1aa,d1am等轨迹文件
+        for k in range(len(action_list)):
+            transition_path = os.path.join(rootpath, action_list[j])#C:\Users\DELL\Desktop\TDQN_PYTORCH\DRL_vedio_data\xt1r1\d1aa
+            for root, dirs, files in os.walk(transition_path):
+                imgfile_list = dirs  # 读取轨迹文件下的图像名列表
+            for img in range(len(image_list)):
+                #len(image_list)计算文件中有多少个图像。然后诸葛循环
+                #计算出 state
+                path_imglist1 = os.path.join(transition_path, image_list[img])  # 生成每个图象的路径
+                img_tmp1 = cv2.imread(path_imglist1)  # 读取图像
+                screen = img_tmp1.transpose((2, 0, 1))  # 修改图像通道位置
+                screen = np.ascontiguousarray(screen, dtype=np.float32) / 255  # 返回一个连续的array，其内存是连续的，运行会更快
+                screen = torch.from_numpy(screen)  # torch.from_numpy()用来将数组array转换为张量Tensor
+                screen.to('cuda:0')  # =======================
+                #第i张图像为state，第i+1张图像为next_state
+                state_queue.append(screen)#我们设置state_queue和next_state_queue的容量为1，因此每次添加都会删除前一个
+                #计算出next_state, reward, a。由于动作和奖励在视频数据中都是固定的，因此不需要过多考虑
+                path_imglist2 = os.path.join(transition_path, image_list[img+1])  # 生成每个图象的路径
+                img_tmp2 = cv2.imread(path_imglist2)  # 读取图像
+                screen = img_tmp2.transpose((2, 0, 1))  # 修改图像通道位置
+                screen = np.ascontiguousarray(screen, dtype=np.float32) / 255  # 返回一个连续的array，其内存是连续的，运行会更快
+                screen = torch.from_numpy(screen)  # torch.from_numpy()用来将数组array转换为张量Tensor
+                screen.to('cuda:0')  # =======================
+                next_state_queue.append(screen)
+                memory.push(state_queue, action, next_state_queue, reward)  # 把计算出来的四个元素集存储到replay buffer中
+
+
+#----------------------------------------------------
+print('------------Start training-------------------')
+num_episodes = 200000#最大迭代次数 Maximum Iterations
+for i_episode in range(num_episodes):
+
+    since = time.time()
+    total_reward = 0
+    #m_reward = 0 # 如果一个episode出现m_reward等于零，说明可能目标检测算法失败
+    #每一个episode开始要随机初始化一个位置
+    #为了提高效率，我们需要尽量将探头的位置设置在中间位置
+    trans_x = random.randint(4, 6)  # 采样点在x轴的位置(0, 10)
+    trans_y = random.randint(3, 5)  # 采样点在轴的位置(0, 8)
+    rotate_xy = random.randint(0, 1)  # 选择是进入绕x轴旋转的空间还是绕y轴旋转的空间
+    fram_US = random.randint(4, 9)  # 选择第几帧图像(0, 16)
+    img_coordinate = [trans_x, trans_y, rotate_xy, fram_US]#随机初始化一个位置
+    #初始化探头位置，此时我们不会选择选择图像。但是，此时探头的初始位姿已经确定了。等待下一个动作，
+    rand_action = random.randint(0, 7)  # Select an action using a random policy
+    img_coordinate = change_imgcoord(img_coordinate,rand_action)#此时，根据第一个动作选择修改img_coordinate的标签，每次只修改一个变量
+    #此时，才进入随机开始阶段。
+    done, state_queue, next_state_queue,twoimg_queue = random_start(img_coordinate,rand_action)
+    if done:
+        continue
+    state = torch.cat(tuple(state_queue), dim=1) #在第一个维度上组合状态序列
+    state.to('cuda:0')  # =======================
+    m_reward = 0
+    for t in count():
+        #reward = 0
+        action = select_action(state)#Select Action use polict network
+        USimagecoord = change_imgcoord(img_coordinate, action.item())
+        imgtensor, imgarr = Sample_img(USimagecoord)
+        twoimg_queue.append(imgarr)#...
+        next_state, reward, done = probe_step(USimagecoord,twoimg_queue)#Select the action, collect the image, and then judge the next state according to the image
+        #Gradient clipping can be done here, but it has no effect in our experiment
+        print('done',done)
+        print('reward: ',reward)
+        m_reward += reward  # Accumulated rewards
+        if not done:
+            #如果还没到达terminal state 即 done = False，则 not done = True，执行下面动作。否则，done = True，not done = False，即agent进入terminal state，跳出循环
+            #Judge whether it is a termial state. If not, go to the next step and collect images
+            action = select_action(state)
+            USimagecoord = change_imgcoord(img_coordinate, action.item())
+            screen, imgt = Sample_img(USimagecoord)
+            twoimg_queue.append(imgarr)
+            next_state_queue.append(screen)#If not termial state, the next image will be acquired next_ state_ queue。
+        else:
+            #  If it is the terminal state, terminate the cycle
+            print('已经是terminal state')
+            break
+
+        #total_reward += reward
+        if not done:
+            next_state = torch.cat(tuple(next_state_queue), dim=1)
+        else:
+            next_state = None
+        #avg_reward.append(m_reward)
+        reward = torch.tensor([reward], device=device)#Convert rewards into tensors
+        memory.push(state, action, next_state, reward)#Store the calculated set of four elements in the replay buffer
+        state = next_state #Change the next state to the current state
+        optimize_model()   #....
+
+        #reward_e = torch.tensor(6*(math.log(i_episode+1)), dtype=torch.float)
+        #rewards = m_reward
+        if done:
+            episode_durations.append(m_reward)
+            #plot_durations()
+            durations_t = episode_durations  #torch.tensor(episode_durations, dtype=torch.float)
+            arr1 = durations_t#.numpy()
+            data1 = pd.DataFrame(arr1)
+            data1.to_csv('data1_1.csv')#存储到csv文件
+            break
+    StepLR.step()#等间隔调整学习率
+        # 更新目标网络，复制DQN中的所有权重和偏置
+    if i_episode % TARGET_UPDATE == 0:
+        target_net.load_state_dict(policy_net.state_dict())
+        if i_episode % 1000 ==0:
+            torch.save(policy_net.state_dict(), 'weights/policy_net_weights_{0}.pth'.format(i_episode))
+    #计算运行时间
+    time_elapsed = time.time() - since
+    #total_rewardall.append(total_reward)
+    total_rewardall.append(m_reward)
+    rewardall_t = torch.tensor(total_rewardall, dtype=torch.float)
+    arr_r = rewardall_t.numpy()
+    datar = pd.DataFrame(arr_r)
+    datar.to_csv('datar_1.csv')  # 存储到csv文件
+    print('获取奖励 m_reward：', m_reward)
+    print('第',i_episode,'个epoch的训练时间：')
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+
+    t_agent = time_elapsed % 60
+    #if m_reward > 500 :
+        #torch.save(policy_net.state_dict(), 'weights/policy_net_weights_timelong_{0}.pth'.format(i_episode))
+
+print('Complete')
+torch.save(policy_net.state_dict(), 'weights/policy_net_weights.pth')
+
