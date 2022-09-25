@@ -1,4 +1,9 @@
 # Robot-ultrasonic-system-based-on-deep-reinforcement-learning
+![image](https://user-images.githubusercontent.com/37693363/192133971-92744b00-171b-45be-a6cb-d962b40cf775.png)
+
+
+
+
 If you do not understand Chinese, please read the introduction below
 
 Training robot ultrasonic system using deep reinforcement learning.Because ultrasound doctors mainly use discrete motion to control ultrasound probes, most current work is based on DQN. The essential learners we use are also DQN series algorithms, but we have improved the algorithms. Considering the individual differences of patients and the safety of patients, we completed the experiment in the simulation environment. In addition, we also set up the molding reward function and other methods to improve the sample efficiency.
