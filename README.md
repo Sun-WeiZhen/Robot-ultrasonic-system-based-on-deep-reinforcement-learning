@@ -48,7 +48,7 @@ We find that if the simulation environment is poorly designed, the training algo
 
 In my four years of doctoral career, two years of detailed analysis, and one year of experimental preparation, until now, I have achieved some works.
 
-
+Sorry, we are not very willing to provide the simulation environment. After all, we spent much time establishing the simulation environment. We will not release the simulation environment data until all our work is done.
 
 如果你是中国人，就看这里吧
 我们的团队包括江苏省人民医院4位国家级超声科医生来详细分析和分解每个器官标准平面的采集任务和动作，我们希望发现一个具有一般性的控制方法。
@@ -81,7 +81,8 @@ In my four years of doctoral career, two years of detailed analysis, and one yea
 我们发现如果仿真环境设计的不好，训练算法一般都是不收敛的。因此，就搭建仿真环境这块，我们花了将近半年的时间。其中主要工作浪费在采集图像和训练上了。
 我四年的博士，两年的详细分析和一年的实验准备，直到现在才有了一些成果。
 
-
+在这个项目中，我们提供了代码和在仿真环境下训练和测试的视频。
+很抱歉，我们不是很愿意提供仿真环境，毕竟我们花费了大量时间来建立仿真环境。在我们的所有工作没有出来之前，我们是不会公布仿真环境的数据的。
 
 
 
