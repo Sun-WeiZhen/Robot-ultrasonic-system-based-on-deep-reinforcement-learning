@@ -46,7 +46,7 @@ Collecting expert demonstration data is relatively simple.
 
 We find that if the simulation environment is poorly designed, the training algorithm is generally nonconvergent. Therefore, it took us nearly half a year to build the simulation environment. The main work is wasted on image acquisition and training.
 
-My doctor's four years, two years of detailed analysis and one year of experimental preparation have only now produced some results.
+In my four years of doctoral career, two years of detailed analysis, and one year of experimental preparation, until now, I have achieved some works.
 
 
 
@@ -79,7 +79,7 @@ My doctor's four years, two years of detailed analysis and one year of experimen
 采集专家演示数据则相对简单。
 
 我们发现如果仿真环境设计的不好，训练算法一般都是不收敛的。因此，就搭建仿真环境这块，我们花了将近半年的时间。其中主要工作浪费在采集图像和训练上了。
-我的博士四年，两年的详细分析和一年的实验准备，就到现在才有了一些成果。
+我四年的博士，两年的详细分析和一年的实验准备，直到现在才有了一些成果。
 
 
 
