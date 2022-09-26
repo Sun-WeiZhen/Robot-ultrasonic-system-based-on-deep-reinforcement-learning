@@ -1,4 +1,4 @@
-# Robot-ultrasonic-system-based-on-deep-reinforcement-learning
+# Robot-ultrasound-system-based-on-deep-reinforcement-learning
 ![image](https://user-images.githubusercontent.com/37693363/192133971-92744b00-171b-45be-a6cb-d962b40cf775.png)
 
 
